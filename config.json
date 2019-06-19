@@ -1,0 +1,36 @@
+{
+    "search": {
+        "opt_level": "O0",
+        "num_workers": 0,
+        "num_epochs": 50,
+        "local_batch_size": 128,
+        "global_batch_denom": 64,
+        "drop_prob": 0.0,
+        "network_lr": 0.025,
+        "network_lr_min": 0.001,
+        "network_momentum": 0.9,
+        "network_weight_decay": 3e-4,
+        "architecture_lr": 3e-4,
+        "architecture_beta1": 0.5,
+        "architecture_beta2": 0.999,
+        "architecture_weight_decay": 1e-3,
+        "epsilon": 1e-2,
+        "checkpoint_directory": "checkpoints/search",
+        "event_directory": "events/search",
+        "architecture_directory": "architectures"
+    },
+    "train": {
+        "opt_level": "O0",
+        "num_workers": 0,
+        "num_epochs": 500,
+        "local_batch_size": 128,
+        "global_batch_denom": 96,
+        "drop_prob": 0.2,
+        "network_lr": 0.025,
+        "network_lr_min": 0.0,
+        "network_momentum": 0.9,
+        "network_weight_decay": 3e-4,
+        "checkpoint_directory": "checkpoints/train",
+        "event_directory": "events/train"
+    }
+}
