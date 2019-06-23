@@ -1,0 +1,18 @@
+{
+    "num_workers": 4,
+    "num_epochs": 150,
+    "local_batch_size": 96,
+    "global_batch_denom": 256,
+    "lr": 0.05,
+    "alpha": 0.9,
+    "eps": 1.0,
+    "weight_decay": 4e-5,
+    "momentum": 0.9,
+    "drop_prob": 0.0,
+    "checkpoint_directory": "/mnt/lustre/sensetime/hiroki_sakuma/Single-Path-NAS/checkpoints/single_path_nas",
+    "event_directory": "/mnt/lustre/sensetime/hiroki_sakuma/Single-Path-NAS/events/single_path_nas",
+    "train_root": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/train",
+    "train_meta": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/meta/train.txt",
+    "val_root": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/val",
+    "val_meta": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/meta/val.txt"
+}

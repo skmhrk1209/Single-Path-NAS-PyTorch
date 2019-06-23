@@ -1,20 +1,15 @@
 import torch
 from torch import nn
-from torch import distributed
 from torch import optim
 from torch import utils
 from torch import backends
-from torch import autograd
-from torchvision import datasets
+from torch import distributed
 from torchvision import transforms
-from torchvision import models
 from tensorboardX import SummaryWriter
-from darts import *
-from ops import *
+from models import *
+from datasets import *
 from utils import *
 import numpy as np
-import skimage
-import functools
 import argparse
 import copy
 import json
@@ -32,13 +27,13 @@ def apply_dict(function, dictionary):
 
 def main(args):
 
+    backends.cudnn.fastest = True
     backends.cudnn.benchmark = True
 
-    # python -m torch.distributed.launch --nproc_per_node=NUM_GPUS main.py
-    distributed.init_process_group(backend='mpi')
+    distributed.init_process_group(backend='nccl')
 
     with open(args.config) as file:
-        config = apply_dict(Dict, json.load(file)).train
+        config = apply_dict(Dict, json.load(file))
     config.update(vars(args))
     config.update(dict(
         world_size=distributed.get_world_size(),
@@ -51,92 +46,76 @@ def main(args):
     torch.manual_seed(0)
     torch.cuda.set_device(config.local_rank)
 
-    model = DARTS(
-        operations=dict(
-            super_sep_conv=functools.partial(SuperSeparableConv2d, kernel_sizes=[3, 5], padding=2),
-            super_dil_conv=functools.partial(SuperDilatedConv2d, kernel_sizes=[3, 5], padding=4, dilation=2),
-            avg_pool_3x3=functools.partial(AvgPool2d, kernel_size=3, padding=1),
-            max_pool_3x3=functools.partial(MaxPool2d, kernel_size=3, padding=1),
-            identity=functools.partial(Identity),
-            zero=functools.partial(Zero)
-        ),
-        num_nodes=6,
-        num_input_nodes=2,
-        num_cells=20,
-        reduction_cells=[6, 13],
-        num_predecessors=2,
-        num_channels=36,
-        num_classes=10,
-        drop_prob_fn=lambda epoch: config.drop_prob * epoch / config.num_epochs
+    model = SuperMobileNetV2(
+        first_conv_param=Dict(in_channels=3, out_channels=32, kernel_size=3, stride=2),
+        middle_conv_params=[
+            Dict(in_channels=32, out_channels=16, expand_ratio_list=[3, 6], kernel_size_list=[3, 5], blocks=1, stride=1),
+            Dict(in_channels=16, out_channels=24, expand_ratio_list=[3, 6], kernel_size_list=[3, 5], blocks=2, stride=2),
+            Dict(in_channels=24, out_channels=32, expand_ratio_list=[3, 6], kernel_size_list=[3, 5], blocks=3, stride=2),
+            Dict(in_channels=32, out_channels=64, expand_ratio_list=[3, 6], kernel_size_list=[3, 5], blocks=4, stride=2),
+            Dict(in_channels=64, out_channels=96, expand_ratio_list=[3, 6], kernel_size_list=[3, 5], blocks=3, stride=1),
+            Dict(in_channels=96, out_channels=160, expand_ratio_list=[3, 6], kernel_size_list=[3, 5], blocks=3, stride=2),
+            Dict(in_channels=160, out_channels=320, expand_ratio_list=[3, 6], kernel_size_list=[3, 5], blocks=1, stride=1),
+        ],
+        last_conv_param=Dict(in_channels=320, out_channels=1280, kernel_size=1, stride=1),
+        num_classes=1000,
+        drop_prob=config.drop_prob
     ).cuda()
-
-    checkpoint = Dict(torch.load('checkpoints/search/epoch_49'))
-    model.architecture.load_state_dict(checkpoint.architecture_state_dict)
-    model.build_discrete_dag()
-    model.build_discrete_network()
-    model = model.cuda()
 
     criterion = nn.CrossEntropyLoss(reduction='mean').cuda()
 
     config.global_batch_size = config.local_batch_size * config.world_size
-    config.network_lr = config.network_lr * config.global_batch_size / config.global_batch_denom
-    config.network_lr_min = config.network_lr_min * config.global_batch_size / config.global_batch_denom
+    config.lr = config.lr * config.global_batch_size / config.global_batch_denom
 
-    network_optimizer = torch.optim.SGD(
-        params=model.network.parameters(),
-        lr=config.network_lr,
-        momentum=config.network_momentum,
-        weight_decay=config.network_weight_decay
+    optimizer = torch.optim.RMSprop(
+        params=model.parameters(),
+        lr=config.lr,
+        alpha=config.alpha,
+        eps=config.eps,
+        weight_decay=config.weight_decay,
+        momentum=config.momentum,
     )
-
-    # nn.parallel.DistributedDataParallel and apex.parallel.DistributedDataParallel don't support multiple backward passes.
-    # This means `all_reduce` is executed when the first backward pass.
-    # So, we manually reduce all gradients.
-    # model = parallel.DistributedDataParallel(model, delay_allreduce=True)
 
     last_epoch = -1
     global_step = 0
     if config.checkpoint:
         checkpoint = Dict(torch.load(config.checkpoint))
-        model.network.load_state_dict(checkpoint.network_state_dict)
-        model.architecture.load_state_dict(checkpoint.architecture_state_dict)
-        network_optimizer.load_state_dict(checkpoint.network_optimizer_state_dict)
+        model.load_state_dict(checkpoint.model_state_dict)
+        optimizer.load_state_dict(checkpoint.optimizer_state_dict)
         last_epoch = checkpoint.last_epoch
         global_step = checkpoint.global_step
 
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer=network_optimizer,
+        optimizer=optimizer,
         T_max=config.num_epochs,
-        eta_min=config.network_lr_min,
         last_epoch=last_epoch
     )
 
-    train_dataset = datasets.CIFAR10(
-        root='cifar10',
-        train=True,
+    train_dataset = ImageNet(
+        root=config.train_root,
+        meta=config.train_meta,
         transform=transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
+            transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(
-                mean=(0.49139968, 0.48215827, 0.44653124),
-                std=(0.24703233, 0.24348505, 0.26158768)
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225)
             ),
-            Cutout(size=(16, 16))
-        ]),
-        download=True
+        ])
     )
-    val_dataset = datasets.CIFAR10(
-        root='cifar10',
-        train=False,
+    val_dataset = ImageNet(
+        root=config.val_root,
+        meta=config.val_meta,
         transform=transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(
-                mean=(0.49139968, 0.48215827, 0.44653124),
-                std=(0.24703233, 0.24348505, 0.26158768)
-            )
-        ]),
-        download=True
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225)
+            ),
+        ])
     )
 
     train_sampler = utils.data.distributed.DistributedSampler(train_dataset)
@@ -167,35 +146,29 @@ def main(args):
         for epoch in range(last_epoch + 1, config.num_epochs):
 
             train_sampler.set_epoch(epoch)
-            model.set_epoch(epoch)
 
             model.train()
 
-            for local_step, (train_images, train_labels) in enumerate(train_data_loader):
+            for local_step, (images, labels) in enumerate(train_data_loader):
 
                 step_begin = time.time()
 
-                train_images = train_images.cuda(non_blocking=True)
-                train_labels = train_labels.cuda(non_blocking=True)
+                images = images.cuda()
+                labels = labels.cuda()
 
-                # Update network parameter.
-                # ----------------------------------------------------------------
-                train_logits = model(train_images)
-                train_loss = criterion(train_logits, train_labels) / config.world_size
+                logits = model(images)
+                loss = criterion(logits, labels) / config.world_size
 
-                network_optimizer.zero_grad()
-
-                train_loss.backward()
-
-                for parameter in model.network.parameters():
+                optimizer.zero_grad()
+                loss.backward()
+                for parameter in model.parameters():
                     distributed.all_reduce(parameter.grad)
-                network_optimizer.step()
-                # ----------------------------------------------------------------
+                optimizer.step()
 
-                train_predictions = torch.argmax(train_logits, dim=1)
-                train_accuracy = torch.mean((train_predictions == train_labels).float()) / config.world_size
+                predictions = logits.topk(1)[1].squeeze()
+                accuracy = torch.mean((predictions == labels).float()) / config.world_size
 
-                for tensor in [train_loss, train_accuracy]:
+                for tensor in [loss, accuracy]:
                     distributed.all_reduce(tensor)
 
                 step_end = time.time()
@@ -203,25 +176,24 @@ def main(args):
                 if config.global_rank == 0:
                     summary_writer.add_scalars(
                         main_tag='loss',
-                        tag_scalar_dict=dict(train=train_loss),
+                        tag_scalar_dict=dict(train=loss),
                         global_step=global_step
                     )
                     summary_writer.add_scalars(
                         main_tag='accuracy',
-                        tag_scalar_dict=dict(train=train_accuracy),
+                        tag_scalar_dict=dict(train=accuracy),
                         global_step=global_step
                     )
                     print(f'[training] epoch: {epoch} global_step: {global_step} local_step: {local_step} '
-                          f'loss: {train_loss:.4f} accuracy: {train_accuracy:.4f} [{step_end - step_begin:.4f}s]')
+                          f'loss: {loss:.4f} accuracy: {accuracy:.4f} [{step_end - step_begin:.4f}s]')
 
                 global_step += 1
 
             if config.global_rank == 0:
 
                 torch.save(dict(
-                    network_state_dict=model.network.state_dict(),
-                    architecture_state_dict=model.architecture.state_dict(),
-                    network_optimizer_state_dict=network_optimizer.state_dict(),
+                    model_state_dict=model.state_dict(),
+                    optimizer_state_dict=optimizer.state_dict(),
                     last_epoch=epoch,
                     global_step=global_step
                 ), f'{config.checkpoint_directory}/epoch_{epoch}')
@@ -239,13 +211,13 @@ def main(args):
 
                     for local_step, (images, labels) in enumerate(val_data_loader):
 
-                        images = images.cuda(non_blocking=True)
-                        labels = labels.cuda(non_blocking=True)
+                        images = images.cuda()
+                        labels = labels.cuda()
 
                         logits = model(images)
                         loss = criterion(logits, labels) / config.world_size
 
-                        predictions = torch.argmax(logits, dim=1)
+                        predictions = logits.topk(1)[1].squeeze()
                         accuracy = torch.mean((predictions == labels).float()) / config.world_size
 
                         for tensor in [loss, accuracy]:
@@ -281,13 +253,13 @@ def main(args):
 
             for local_step, (images, labels) in enumerate(val_data_loader):
 
-                images = images.cuda(non_blocking=True)
-                labels = labels.cuda(non_blocking=True)
+                images = images.cuda()
+                labels = labels.cuda()
 
                 logits = model(images)
                 loss = criterion(logits, labels) / config.world_size
 
-                predictions = torch.argmax(logits, dim=1)
+                predictions = logits.topk(1)[1].squeeze()
                 accuracy = torch.mean((predictions == labels).float()) / config.world_size
 
                 for tensor in [loss, accuracy]:
@@ -308,14 +280,11 @@ def main(args):
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser(description='DARTS: Differentiable Architecture Search')
-    parser.add_argument('--config', type=str, default='config.json')
+    parser = argparse.ArgumentParser(description='Single-Path-NAS')
+    parser.add_argument('--config', type=str, default='')
     parser.add_argument('--checkpoint', type=str, default='')
     parser.add_argument('--training', action='store_true')
     parser.add_argument('--validation', action='store_true')
-    parser.add_argument('--evaluation', action='store_true')
-    parser.add_argument('--inference', action='store_true')
-    parser.add_argument('--local_rank', type=int)
     args = parser.parse_args()
 
     main(args)

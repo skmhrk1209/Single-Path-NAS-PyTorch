@@ -1,330 +1,66 @@
 import torch
 from torch import nn
-import numpy as np
 
 
 class SuperConv2d(nn.Module):
 
-    def __init__(self, in_channels, out_channels, kernel_sizes, padding=0, stride=1, dilation=1, groups=1, bias=True):
+    def __init__(self, in_channels, out_channels=None, out_channels_list=[], kernel_size=None,  kernel_size_list=[],
+                 padding=0, stride=1, dilation=1, groups=1, bias=True):
 
         super().__init__()
 
-        max_kernel_size = max(kernel_sizes)
+        max_out_channels = max(out_channels_list) if out_channels_list else out_channels
+        max_kernel_size = max(kernel_size_list) if kernel_size_list else kernel_size
 
-        self.super_weight = nn.init.kaiming_normal_(nn.Parameter(torch.Tensor(out_channels, in_channels // groups, max_kernel_size, max_kernel_size)))
-        self.bias = nn.init.zeros_(nn.Parameter(torch.Tensor(out_channels))) if bias else None
-        self.thresholds = nn.init.zeros_(nn.Parameter(torch.Tensor(len(kernel_sizes))))
+        channel_masks = []
+        prev_out_channels = None
+        for out_channels in out_channels_list:
+            channel_mask = torch.ones(max_out_channels)
+            channel_mask *= nn.functional.pad(torch.ones(out_channels), [0, max_out_channels - out_channels], value=0)
+            if prev_out_channels:
+                channel_mask *= nn.functional.pad(torch.zeros(prev_out_channels), [0, max_out_channels - prev_out_channels], value=1)
+            channel_mask = channel_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            prev_out_channels = out_channels
+            channel_masks.append(channel_mask)
 
-        masks = []
-        for i, kernel_size in enumerate(kernel_sizes):
-            mask = torch.ones(1, 1, max_kernel_size, max_kernel_size)
-            mask *= nn.functional.pad(torch.ones(1, 1, kernel_size, kernel_size), [(max_kernel_size - kernel_size) // 2] * 4, value=0)
-            mask *= nn.functional.pad(torch.zeros(1, 1, prev_kernel_size, prev_kernel_size), [(max_kernel_size - prev_kernel_size) // 2] * 4, value=1) if i else 1
+        self.register_buffer('channel_masks', torch.stack(channel_masks, dim=0) if out_channels_list else None)
+        self.register_parameter('channel_thresholds', nn.Parameter(torch.zeros(len(out_channels_list))) if out_channels_list else None)
+
+        kernel_masks = []
+        prev_kernel_size = None
+        for kernel_size in kernel_size_list:
+            kernel_mask = torch.ones(max_kernel_size, max_kernel_size)
+            kernel_mask *= nn.functional.pad(torch.ones(kernel_size, kernel_size), [(max_kernel_size - kernel_size) // 2] * 4, value=0)
+            if prev_kernel_size:
+                kernel_mask *= nn.functional.pad(torch.zeros(prev_kernel_size, prev_kernel_size), [(max_kernel_size - prev_kernel_size) // 2] * 4, value=1)
+            kernel_mask = kernel_mask.unsqueeze(0).unsqueeze(0)
             prev_kernel_size = kernel_size
-            masks.append(mask)
-        self.register_buffer('masks', torch.stack(masks, dim=0))
+            kernel_masks.append(kernel_mask)
 
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_sizes = kernel_sizes
+        self.register_buffer('kernel_masks', torch.stack(kernel_masks, dim=0) if kernel_size_list else None)
+        self.register_parameter('kernel_thresholds', nn.Parameter(torch.zeros(len(kernel_size_list))) if kernel_size_list else None)
+
+        self.register_parameter('weight', nn.Parameter(torch.Tensor(max_out_channels, in_channels // groups, max_kernel_size, max_kernel_size)))
+        self.register_parameter('bias', nn.Parameter(torch.Tensor(max_out_channels)) if bias else None)
+
         self.padding = padding
         self.stride = stride
         self.dilation = dilation
         self.groups = groups
-        self.freezed = False
 
     def forward(self, input):
+        weight = self.weight
+        if self.channel_masks is not None and self.channel_thresholds is not None:
+            weight = weight * self.parametrized_mask(list(self.channel_masks), list(self.channel_thresholds))
+        if self.kernel_masks is not None and self.kernel_thresholds is not None:
+            weight = weight * self.parametrized_mask(list(self.kernel_masks), list(self.kernel_thresholds))
+        return nn.functional.conv2d(input, weight, self.bias, padding=self.padding, stride=self.stride, dilation=self.dilation, groups=self.groups)
 
-        super_weight = torch.zeros_like(self.super_weight)
-        for i, (mask, threshold) in enumerate(zip(self.masks, self.thresholds)):
-            weight = self.super_weight * mask
-            norm = torch.norm(weight)
-            indicator = (norm > threshold) - torch.sigmoid(norm - threshold).detach() + torch.sigmoid(norm - threshold)
-            super_weight += (indicator if i else 1) * weight
-
-        return nn.functional.conv2d(
-            input=input,
-            weight=super_weight,
-            bias=self.bias,
-            padding=self.padding,
-            stride=self.stride,
-            dilation=self.dilation,
-            groups=self.groups
-        )
-
-
-class SuperDilatedConv2d(nn.Module):
-
-    def __init__(self, in_channels, out_channels, kernel_sizes, padding, stride, dilation, affine, preactivation=True, **kwargs):
-        super().__init__()
-        self.module = nn.Sequential(
-            nn.ReLU() if preactivation else nn.Identity(),
-            SuperConv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_sizes=kernel_sizes,
-                padding=padding,
-                stride=stride,
-                dilation=dilation,
-                groups=in_channels,
-                bias=False
-            ),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(
-                num_features=out_channels,
-                affine=affine
-            )
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class SuperSeparableConv2d(nn.Module):
-
-    def __init__(self, in_channels, out_channels, kernel_sizes, padding, stride,
-                 affine, preactivation=True, **kwargs):
-        super().__init__()
-        self.module = nn.Sequential(
-            nn.ReLU() if preactivation else nn.Identity(),
-            SuperConv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_sizes=kernel_sizes,
-                padding=padding,
-                stride=stride,
-                groups=in_channels,
-                bias=False
-            ),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(
-                num_features=in_channels,
-                affine=affine
-            ),
-            nn.ReLU(),
-            SuperConv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_sizes=kernel_sizes,
-                padding=padding,
-                groups=in_channels,
-                bias=False
-            ),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(
-                num_features=out_channels,
-                affine=affine
-            )
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class Conv2d(nn.Module):
-
-    def __init__(self, in_channels, out_channels, kernel_size, padding, stride, affine, preactivation=True, **kwargs):
-        super().__init__()
-        self.module = nn.Sequential(
-            nn.ReLU() if preactivation else nn.Identity(),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                padding=padding,
-                stride=stride,
-                bias=False
-            ),
-            nn.BatchNorm2d(
-                num_features=out_channels,
-                affine=affine
-            )
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class DilatedConv2d(nn.Module):
-
-    def __init__(self, in_channels, out_channels, kernel_size, padding, stride, dilation, affine, preactivation=True, **kwargs):
-        super().__init__()
-        self.module = nn.Sequential(
-            nn.ReLU() if preactivation else nn.Identity(),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_size=kernel_size,
-                padding=padding,
-                stride=stride,
-                dilation=dilation,
-                groups=in_channels,
-                bias=False
-            ),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(
-                num_features=out_channels,
-                affine=affine
-            )
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class SeparableConv2d(nn.Module):
-
-    def __init__(self, in_channels, out_channels, kernel_size, padding, stride, affine, preactivation=True, **kwargs):
-        super().__init__()
-        self.module = nn.Sequential(
-            nn.ReLU() if preactivation else nn.Identity(),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_size=kernel_size,
-                padding=padding,
-                stride=stride,
-                groups=in_channels,
-                bias=False
-            ),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(
-                num_features=in_channels,
-                affine=affine
-            ),
-            nn.ReLU(),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=in_channels,
-                kernel_size=kernel_size,
-                padding=padding,
-                groups=in_channels,
-                bias=False
-            ),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(
-                num_features=out_channels,
-                affine=affine
-            )
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class AvgPool2d(nn.Module):
-
-    def __init__(self, kernel_size, padding, stride, **kwargs):
-        super().__init__()
-        self.module = nn.AvgPool2d(
-            kernel_size=kernel_size,
-            padding=padding,
-            stride=stride
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class MaxPool2d(nn.Module):
-
-    def __init__(self, kernel_size, padding, stride, **kwargs):
-        super().__init__()
-        self.module = nn.MaxPool2d(
-            kernel_size=kernel_size,
-            padding=padding,
-            stride=stride
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class Identity(nn.Module):
-
-    def __init__(self, in_channels, out_channels, stride, affine, preactivation=True, **kwargs):
-        super().__init__()
-        self.module = nn.Identity() if stride == 1 and in_channels == out_channels else Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=1,
-            padding=0,
-            stride=stride,
-            affine=affine,
-            preactivation=preactivation
-        )
-
-    def forward(self, input):
-        return self.module(input)
-
-
-class Zero(nn.Module):
-
-    def __init__(self, **kwargs):
-        super().__init__()
-
-    def forward(self, input):
-        return 0.0
-
-
-class ScheduledDropPath(nn.Module):
-
-    def __init__(self, drop_prob_fn):
-        super().__init__()
-        self.drop_prob_fn = drop_prob_fn
-
-    def forward(self, input):
-        drop_prob = self.drop_prob_fn(self.epoch)
-        if self.training and drop_prob > 0:
-            keep_prob = 1 - drop_prob
-            mask = input.new_full((input.size(0), 1, 1, 1), keep_prob).bernoulli()
-            input = input * mask
-            input = input / keep_prob
-        return input
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-
-
-class Cutout(object):
-
-    def __init__(self, size):
-        self.size = size
-
-    def __call__(self, input):
-        y_min = torch.randint(input.size(-2) - self.size[-2], (1,))
-        x_min = torch.randint(input.size(-1) - self.size[-1], (1,))
-        y_max = y_min + self.size[-2]
-        x_max = x_min + self.size[-1]
-        input[..., y_min:y_max, x_min:x_max] = 0
-        return input
+    def parametrized_mask(self, masks, thresholds):
+        if not masks or not thresholds:
+            return 0
+        mask = masks.pop(0)
+        threshold = thresholds.pop(0)
+        norm = torch.norm(self.weight * mask)
+        indicator = (norm > threshold).float() - torch.sigmoid(norm - threshold).detach() + torch.sigmoid(norm - threshold)
+        return indicator * (mask + self.parametrized_mask(masks, thresholds))
