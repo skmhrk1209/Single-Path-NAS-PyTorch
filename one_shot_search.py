@@ -43,6 +43,51 @@ def main(args):
     ))
     print(f'config: {config}')
 
+    train_dataset = ImageNet(
+        root=config.train_root,
+        meta=config.train_meta,
+        transform=transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225)
+            ),
+        ])
+    )
+    val_dataset = ImageNet(
+        root=config.val_root,
+        meta=config.val_meta,
+        transform=transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225)
+            ),
+        ])
+    )
+
+    train_sampler = utils.data.distributed.DistributedSampler(train_dataset)
+    val_sampler = utils.data.distributed.DistributedSampler(val_dataset)
+
+    train_data_loader = utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_size=config.local_batch_size,
+        sampler=train_sampler,
+        num_workers=config.num_workers,
+        pin_memory=True
+    )
+    val_data_loader = utils.data.DataLoader(
+        dataset=val_dataset,
+        batch_size=config.local_batch_size,
+        sampler=val_sampler,
+        num_workers=config.num_workers,
+        pin_memory=True
+    )
+
     torch.manual_seed(0)
     torch.cuda.set_device(config.local_rank)
 
@@ -91,51 +136,6 @@ def main(args):
         last_epoch=last_epoch
     )
 
-    train_dataset = ImageNet(
-        root=config.train_root,
-        meta=config.train_meta,
-        transform=transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225)
-            ),
-        ])
-    )
-    val_dataset = ImageNet(
-        root=config.val_root,
-        meta=config.val_meta,
-        transform=transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225)
-            ),
-        ])
-    )
-
-    train_sampler = utils.data.distributed.DistributedSampler(train_dataset)
-    val_sampler = utils.data.distributed.DistributedSampler(val_dataset)
-
-    train_data_loader = utils.data.DataLoader(
-        dataset=train_dataset,
-        batch_size=config.local_batch_size,
-        sampler=train_sampler,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-    val_data_loader = utils.data.DataLoader(
-        dataset=val_dataset,
-        batch_size=config.local_batch_size,
-        sampler=val_sampler,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-
     if config.global_rank == 0:
         os.makedirs(config.checkpoint_directory, exist_ok=True)
         os.makedirs(config.event_directory, exist_ok=True)
@@ -146,6 +146,7 @@ def main(args):
         for epoch in range(last_epoch + 1, config.num_epochs):
 
             train_sampler.set_epoch(epoch)
+            lr_scheduler.step(epoch)
 
             model.train()
 
@@ -197,8 +198,6 @@ def main(args):
                     last_epoch=epoch,
                     global_step=global_step
                 ), f'{config.checkpoint_directory}/epoch_{epoch}')
-
-            lr_scheduler.step()
 
             if config.validation:
 

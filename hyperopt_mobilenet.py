@@ -148,7 +148,7 @@ def main(args):
         lr_scheduler = lr_schedulers[trial.suggest_categorical('lr_scheduler', list(lr_schedulers))]
         return lr_scheduler(trial, optimizer)
 
-    def objective(trial):
+    def objective(trial=None):
 
         if config.global_rank == 0:
             checkpoint_directory = os.path.join(config.checkpoint_directory, f'trial_{trial.number}')
@@ -168,7 +168,6 @@ def main(args):
             global_step = checkpoint.global_step
             config.checkpoint = ''
         else:
-            # ...
             checkpoint = os.path.join(checkpoint_directory, f'epoch_{last_epoch}')
             if config.global_rank == 0:
                 optimizer = suggest_optimizer(trial, model)
@@ -181,7 +180,8 @@ def main(args):
                     global_step=global_step
                 ), checkpoint)
             # distributed.barrier()
-            distributed.broadcast(torch.empty(0), 0)
+            empty = torch.empty(1)
+            distributed.broadcast(empty, 0)
             # distributed.broadcast([optimizer, lr_scheduler], 0)
             if config.global_rank != 0:
                 checkpoint = torch.load(checkpoint)
@@ -285,31 +285,38 @@ def main(args):
 
             should_prune = torch.zeros(1)
             if config.global_rank == 0:
-                trial.report(average_loss, epoch)
+                trial.report(average_loss.item(), epoch)
                 if trial.should_prune():
                     should_prune += 1
+
             distributed.broadcast(should_prune, 0)
+
             if should_prune:
                 if config.global_rank == 0:
                     summary_writer.close()
                     raise optuna.structs.TrialPruned()
                 else:
-                    return
+                    return average_loss
 
         if config.global_rank == 0:
             summary_writer.close()
 
-        return average_loss
+        return average_loss.item()
 
-    study = optuna.load_study(
-        study_name=config.hyperopt.study_name,
-        storage=config.hyperopt.storage,
-        pruner=optuna.pruners.SuccessiveHalvingPruner(
-            min_resource=config.hyperopt.pruner.min_resource,
-            reduction_factor=config.hyperopt.pruner.reduction_factor,
-            min_early_stopping_rate=config.hyperopt.pruner.min_early_stopping_rate
+    if config.global_rank == 0:
+        study = optuna.load_study(
+            study_name=config.hyperopt.study_name,
+            storage=config.hyperopt.storage,
+            pruner=optuna.pruners.SuccessiveHalvingPruner(
+                min_resource=config.hyperopt.pruner.min_resource,
+                reduction_factor=config.hyperopt.pruner.reduction_factor,
+                min_early_stopping_rate=config.hyperopt.pruner.min_early_stopping_rate
+            )
         )
-    )
+    else:
+        while True:
+            objective()
+
     study.optimize(objective, n_trials=config.hyperopt.n_trials)
     print(f'best_parameters: {study.best_params}')
 

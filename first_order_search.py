@@ -43,6 +43,60 @@ def main(args):
     ))
     print(f'config: {config}')
 
+    train_dataset = ImageNet(
+        root=config.train_root,
+        meta=config.train_meta,
+        transform=transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225)
+            ),
+        ])
+    )
+    train_datasets = [
+        utils.data.Subset(train_dataset, indices)
+        for indices in np.array_split(range(len(train_dataset)), 2)
+    ]
+    val_dataset = ImageNet(
+        root=config.val_root,
+        meta=config.val_meta,
+        transform=transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.485, 0.456, 0.406),
+                std=(0.229, 0.224, 0.225)
+            ),
+        ])
+    )
+
+    train_samplers = [
+        utils.data.distributed.DistributedSampler(train_dataset)
+        for train_dataset in train_datasets
+    ]
+    val_sampler = utils.data.distributed.DistributedSampler(val_dataset)
+
+    train_data_loaders = [
+        utils.data.DataLoader(
+            dataset=train_dataset,
+            batch_size=config.local_batch_size,
+            sampler=train_sampler,
+            num_workers=config.num_workers,
+            pin_memory=True
+        ) for train_dataset, train_sampler in zip(train_datasets, train_samplers)
+    ]
+    val_data_loader = utils.data.DataLoader(
+        dataset=val_dataset,
+        batch_size=config.local_batch_size,
+        sampler=val_sampler,
+        num_workers=config.num_workers,
+        pin_memory=True
+    )
+
     torch.manual_seed(0)
     torch.cuda.set_device(config.local_rank)
 
@@ -100,60 +154,6 @@ def main(args):
         last_epoch=last_epoch
     )
 
-    train_dataset = ImageNet(
-        root=config.train_root,
-        meta=config.train_meta,
-        transform=transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225)
-            ),
-        ])
-    )
-    train_datasets = [
-        utils.data.Subset(train_dataset, indices)
-        for indices in np.array_split(range(len(train_dataset)), 2)
-    ]
-    val_dataset = ImageNet(
-        root=config.val_root,
-        meta=config.val_meta,
-        transform=transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225)
-            ),
-        ])
-    )
-
-    train_samplers = [
-        utils.data.distributed.DistributedSampler(train_dataset)
-        for train_dataset in train_datasets
-    ]
-    val_sampler = utils.data.distributed.DistributedSampler(val_dataset)
-
-    train_data_loaders = [
-        utils.data.DataLoader(
-            dataset=train_dataset,
-            batch_size=config.local_batch_size,
-            sampler=train_sampler,
-            num_workers=config.num_workers,
-            pin_memory=True
-        ) for train_dataset, train_sampler in zip(train_datasets, train_samplers)
-    ]
-    val_data_loader = utils.data.DataLoader(
-        dataset=val_dataset,
-        batch_size=config.local_batch_size,
-        sampler=val_sampler,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-
     if config.global_rank == 0:
         os.makedirs(config.checkpoint_directory, exist_ok=True)
         os.makedirs(config.event_directory, exist_ok=True)
@@ -165,6 +165,7 @@ def main(args):
 
             for train_sampler in train_samplers:
                 train_sampler.set_epoch(epoch)
+            lr_scheduler.step(epoch)
 
             model.train()
 
@@ -178,74 +179,18 @@ def main(args):
                 val_images = val_images.cuda()
                 val_labels = val_labels.cuda()
 
-                # Save current network parameters and optimizer.
-                named_weights = copy.deepcopy(list(model.named_weights()))
-                named_buffers = copy.deepcopy(list(model.named_buffers()))
-                weight_optimizer_state_dict = copy.deepcopy(weight_optimizer.state_dict())
-
-                # Approximate w*(α) by adapting w using only a single training step,
-                # without solving the inner optimization completely by training until convergence.
-                # ----------------------------------------------------------------
-                train_logits = model(train_images)
-                train_loss = criterion(train_logits, train_labels) / config.world_size
-
-                weight_optimizer.zero_grad()
-                threshold_optimizer.zero_grad()
-
-                train_loss.backward()
-
-                for weight in model.weights():
-                    distributed.all_reduce(weight.grad)
-
-                weight_optimizer.step()
-                # ----------------------------------------------------------------
-
-                # Apply chain rule to the approximate architecture gradient.
-                # Backward validation loss, but don't update approximate parameter w'.
-                # ----------------------------------------------------------------
                 val_logits = model(val_images)
                 val_loss = criterion(val_logits, val_labels) / config.world_size
 
-                weight_optimizer.zero_grad()
                 threshold_optimizer.zero_grad()
 
                 val_loss.backward()
 
-                named_weight_gradients = copy.deepcopy(list(model.named_weight_gradients()))
-                weight_gradient_norm = torch.norm(torch.cat([weight_gradient.reshape(-1) for name, weight_gradient in named_weight_gradients]))
-                # ----------------------------------------------------------------
-
-                # Avoid calculate hessian-vector product using the finite difference approximation.
-                # ----------------------------------------------------------------
-                for weight, (name, prev_weight), (name, prev_weight_gradient) in zip(model.weights(), named_weights, named_weight_gradients):
-                    weight.data = (prev_weight + prev_weight_gradient * config.epsilon / weight_gradient_norm).data
-
-                train_logits = model(train_images)
-                train_loss = criterion(train_logits, train_labels) * -(config.weight_optimizer.lr / (2 * config.epsilon / weight_gradient_norm)) / config.world_size
-
-                train_loss.backward()
-
-                for weight, (name, prev_weight), (name, prev_weight_gradient) in zip(model.weights(), named_weights, named_weight_gradients):
-                    weight.data = (prev_weight - prev_weight_gradient * config.epsilon / weight_gradient_norm).data
-
-                train_logits = model(train_images)
-                train_loss = criterion(train_logits, train_labels) * (config.weight_optimizer.lr / (2 * config.epsilon / weight_gradient_norm)) / config.world_size
-
-                train_loss.backward()
-                # ----------------------------------------------------------------
-                # Finally, update architecture parameter.
                 for threshold in model.thresholds():
                     distributed.all_reduce(threshold.grad)
 
                 threshold_optimizer.step()
-                # ----------------------------------------------------------------
 
-                # Restore previous network parameters and optimizer.
-                model.load_state_dict(dict(**dict(named_weights), **dict(named_buffers)), strict=False)
-                weight_optimizer.load_state_dict(weight_optimizer_state_dict)
-
-                # Update network parameter.
-                # ----------------------------------------------------------------
                 train_logits = model(train_images)
                 train_loss = criterion(train_logits, train_labels) / config.world_size
 
@@ -290,8 +235,6 @@ def main(args):
                     last_epoch=epoch,
                     global_step=global_step
                 ), f'{config.checkpoint_directory}/epoch_{epoch}')
-
-            lr_scheduler.step()
 
             if config.validation:
 
