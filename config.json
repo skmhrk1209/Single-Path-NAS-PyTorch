@@ -18,10 +18,10 @@
     "epsilon": 1e-2,
     "split_ratio": 0.5,
     "label_smoothing": 0.1,
-    "checkpoint_directory": "/mnt/lustre/sensetime/hiroki_sakuma/Single-Path-NAS/checkpoints/single_level_search",
-    "event_directory": "/mnt/lustre/sensetime/hiroki_sakuma/Single-Path-NAS/events/single_level_search",
-    "train_root": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/train",
-    "train_meta": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/meta/train.txt",
-    "val_root": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/val",
-    "val_meta": "/mnt/lustre/sensetime/share/DataSet/ilsvrc2012/meta/val.txt"
+    "checkpoint_directory": "checkpoints",
+    "event_directory": "events",
+    "train_root": "DataSet/ilsvrc2012/train",
+    "train_meta": "DataSet/ilsvrc2012/meta/train.txt",
+    "val_root": "DataSet/ilsvrc2012/val",
+    "val_meta": "DataSet/ilsvrc2012/meta/val.txt"
 }
