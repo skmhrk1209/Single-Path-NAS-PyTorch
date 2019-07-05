@@ -1,36 +1,34 @@
 import torch
 from torch import nn
+from torch import distributed
 from torch import optim
 from torch import utils
+from torch import cuda
 from torch import backends
-from torch import distributed
+from torch import autograd
+from torchvision import datasets
 from torchvision import transforms
+from torchvision import models
 from tensorboardX import SummaryWriter
 from models import *
+from ops import *
 from datasets import *
+from distributed import *
 from utils import *
 import numpy as np
+import skimage
+import functools
 import argparse
+import shutil
 import copy
 import json
 import time
 import os
 
 
-def apply_dict(function, dictionary):
-    if isinstance(dictionary, dict):
-        for key, value in dictionary.items():
-            dictionary[key] = apply_dict(function, value)
-        dictionary = function(dictionary)
-    return dictionary
-
-
 def main(args):
 
-    backends.cudnn.fastest = True
-    backends.cudnn.benchmark = True
-
-    distributed.init_process_group(backend='nccl')
+    init_process_group(backend='nccl')
 
     with open(args.config) as file:
         config = apply_dict(Dict, json.load(file))
@@ -38,10 +36,18 @@ def main(args):
     config.update(dict(
         world_size=distributed.get_world_size(),
         global_rank=distributed.get_rank(),
-        device_count=torch.cuda.device_count(),
-        local_rank=distributed.get_rank() % torch.cuda.device_count()
+        device_count=cuda.device_count(),
+        local_rank=distributed.get_rank() % cuda.device_count()
     ))
     print(f'config: {config}')
+
+    backends.cudnn.benchmark = True
+    backends.cudnn.fastest = True
+
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    cuda.manual_seed(config.seed)
+    cuda.set_device(config.local_rank)
 
     train_dataset = ImageNet(
         root=config.train_root,
@@ -49,17 +55,19 @@ def main(args):
         transform=transforms.Compose([
             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(
+                brightness=0.4,
+                contrast=0.4,
+                saturation=0.4,
+                hue=0.2
+            ),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=(0.485, 0.456, 0.406),
                 std=(0.229, 0.224, 0.225)
-            ),
+            )
         ])
     )
-    train_datasets = [
-        utils.data.Subset(train_dataset, indices)
-        for indices in np.array_split(range(len(train_dataset)), 2)
-    ]
     val_dataset = ImageNet(
         root=config.val_root,
         meta=config.val_meta,
@@ -74,21 +82,16 @@ def main(args):
         ])
     )
 
-    train_samplers = [
-        utils.data.distributed.DistributedSampler(train_dataset)
-        for train_dataset in train_datasets
-    ]
+    train_sampler = utils.data.distributed.DistributedSampler(train_dataset)
     val_sampler = utils.data.distributed.DistributedSampler(val_dataset)
 
-    train_data_loaders = [
-        utils.data.DataLoader(
-            dataset=train_dataset,
-            batch_size=config.local_batch_size,
-            sampler=train_sampler,
-            num_workers=config.num_workers,
-            pin_memory=True
-        ) for train_dataset, train_sampler in zip(train_datasets, train_samplers)
-    ]
+    train_data_loader = utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_size=config.local_batch_size,
+        sampler=train_sampler,
+        num_workers=config.num_workers,
+        pin_memory=True
+    )
     val_data_loader = utils.data.DataLoader(
         dataset=val_dataset,
         batch_size=config.local_batch_size,
@@ -96,9 +99,6 @@ def main(args):
         num_workers=config.num_workers,
         pin_memory=True
     )
-
-    torch.manual_seed(0)
-    torch.cuda.set_device(config.local_rank)
 
     model = SuperMobileNetV2(
         first_conv_param=Dict(in_channels=3, out_channels=32, kernel_size=3, stride=2),
@@ -116,27 +116,26 @@ def main(args):
         num_classes=1000
     ).cuda()
 
-    criterion = nn.CrossEntropyLoss(reduction='mean').cuda()
+    for tensor in model.state_dict().values():
+        distributed.broadcast(tensor, 0)
+
+    criterion = CrossEntropyLoss(config.label_smoothing)
 
     config.global_batch_size = config.local_batch_size * config.world_size
-    config.weight_optimizer.lr = config.weight_optimizer.lr * config.global_batch_size / config.global_batch_denom
-    config.threshold_optimizer.lr = config.threshold_optimizer.lr * config.global_batch_size / config.global_batch_denom
+    config.lr = config.lr * config.global_batch_size / config.global_batch_denom
 
-    weight_optimizer = torch.optim.RMSprop(
+    optimizer = torch.optim.RMSprop(
         params=model.weights(),
-        lr=config.weight_optimizer.lr,
-        alpha=config.weight_optimizer.alpha,
-        eps=config.weight_optimizer.eps,
-        weight_decay=config.weight_optimizer.weight_decay,
-        momentum=config.weight_optimizer.momentum
+        lr=config.lr,
+        alpha=config.alpha,
+        eps=config.eps,
+        weight_decay=config.weight_decay,
+        momentum=config.momentum
     )
-
-    threshold_optimizer = torch.optim.Adam(
-        params=model.thresholds(),
-        lr=config.threshold_optimizer.lr,
-        betas=config.threshold_optimizer.betas,
-        eps=config.threshold_optimizer.eps,
-        weight_decay=config.threshold_optimizer.weight_decay
+    lr_scheduler = optim.lr_scheduler.MultiStepLR(
+        optimizer=optimizer,
+        milestones=config.milestones,
+        gamma=config.gamma
     )
 
     last_epoch = -1
@@ -144,69 +143,52 @@ def main(args):
     if config.checkpoint:
         checkpoint = Dict(torch.load(config.checkpoint))
         model.load_state_dict(checkpoint.model_state_dict)
-        weight_optimizer.load_state_dict(checkpoint.optimizer_state_dict)
+        optimizer.load_state_dict(checkpoint.optimizer_state_dict)
         last_epoch = checkpoint.last_epoch
         global_step = checkpoint.global_step
-
-    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer=weight_optimizer,
-        T_max=config.num_epochs,
-        last_epoch=last_epoch
-    )
+    elif config.global_rank == 0:
+        if os.path.exists(config.checkpoint_directory):
+            shutil.rmtree(config.checkpoint_directory)
+        if os.path.exists(config.event_directory):
+            shutil.rmtree(config.event_directory)
+        os.makedirs(config.checkpoint_directory)
+        os.makedirs(config.event_directory)
 
     if config.global_rank == 0:
-        os.makedirs(config.checkpoint_directory, exist_ok=True)
-        os.makedirs(config.event_directory, exist_ok=True)
         summary_writer = SummaryWriter(config.event_directory)
 
     if config.training:
 
         for epoch in range(last_epoch + 1, config.num_epochs):
 
-            for train_sampler in train_samplers:
-                train_sampler.set_epoch(epoch)
+            train_sampler.set_epoch(epoch)
             lr_scheduler.step(epoch)
 
             model.train()
 
-            for local_step, ((train_images, train_labels), (val_images, val_labels)) in enumerate(zip(*train_data_loaders)):
+            for local_step, (images, targets) in enumerate(train_data_loader):
 
                 step_begin = time.time()
 
-                train_images = train_images.cuda()
-                train_labels = train_labels.cuda()
+                images = images.cuda(non_blocking=True)
+                targets = targets.cuda(non_blocking=True)
 
-                val_images = val_images.cuda()
-                val_labels = val_labels.cuda()
+                logits = model(images)
+                loss = criterion(logits, targets) / config.world_size
 
-                val_logits = model(val_images)
-                val_loss = criterion(val_logits, val_labels) / config.world_size
+                optimizer.zero_grad()
 
-                threshold_optimizer.zero_grad()
+                loss.backward()
 
-                val_loss.backward()
+                for parameter in model.parameters():
+                    distributed.all_reduce(parameter.grad)
 
-                for threshold in model.thresholds():
-                    distributed.all_reduce(threshold.grad)
+                optimizer.step()
 
-                threshold_optimizer.step()
+                predictions = torch.argmax(logits, dim=1)
+                accuracy = torch.mean((predictions == targets).float()) / config.world_size
 
-                train_logits = model(train_images)
-                train_loss = criterion(train_logits, train_labels) / config.world_size
-
-                weight_optimizer.zero_grad()
-
-                train_loss.backward()
-
-                for weight in model.weights():
-                    distributed.all_reduce(weight.grad)
-
-                weight_optimizer.step()
-
-                train_predictions = train_logits.topk(1)[1].squeeze()
-                train_accuracy = torch.mean((train_predictions == train_labels).float()) / config.world_size
-
-                for tensor in [train_loss, train_accuracy]:
+                for tensor in [loss, accuracy]:
                     distributed.all_reduce(tensor)
 
                 step_end = time.time()
@@ -214,24 +196,23 @@ def main(args):
                 if config.global_rank == 0:
                     summary_writer.add_scalars(
                         main_tag='loss',
-                        tag_scalar_dict=dict(train=train_loss),
+                        tag_scalar_dict=dict(train=loss),
                         global_step=global_step
                     )
                     summary_writer.add_scalars(
                         main_tag='accuracy',
-                        tag_scalar_dict=dict(train=train_accuracy),
+                        tag_scalar_dict=dict(train=accuracy),
                         global_step=global_step
                     )
                     print(f'[training] epoch: {epoch} global_step: {global_step} local_step: {local_step} '
-                          f'loss: {train_loss:.4f} accuracy: {train_accuracy:.4f} [{step_end - step_begin:.4f}s]')
+                          f'loss: {loss:.4f} accuracy: {accuracy:.4f} [{step_end - step_begin:.4f}s]')
 
                 global_step += 1
 
             if config.global_rank == 0:
                 torch.save(dict(
                     model_state_dict=model.state_dict(),
-                    weight_optimizer_state_dict=weight_optimizer.state_dict(),
-                    threshold_optimizer_state_dict=threshold_optimizer.state_dict(),
+                    optimizer_state_dict=optimizer.state_dict(),
                     last_epoch=epoch,
                     global_step=global_step
                 ), f'{config.checkpoint_directory}/epoch_{epoch}')
@@ -245,22 +226,22 @@ def main(args):
                     average_loss = 0
                     average_accuracy = 0
 
-                    for local_step, (val_images, val_labels) in enumerate(val_data_loader):
+                    for local_step, (images, targets) in enumerate(val_data_loader):
 
-                        val_images = val_images.cuda()
-                        val_labels = val_labels.cuda()
+                        images = images.cuda(non_blocking=True)
+                        targets = targets.cuda(non_blocking=True)
 
-                        val_logits = model(val_images)
-                        val_loss = criterion(val_logits, val_labels) / config.world_size
+                        logits = model(images)
+                        loss = criterion(logits, targets) / config.world_size
 
-                        val_predictions = val_logits.topk(1)[1].squeeze()
-                        val_accuracy = torch.mean((val_predictions == val_labels).float()) / config.world_size
+                        predictions = torch.argmax(logits, dim=1)
+                        accuracy = torch.mean((predictions == targets).float()) / config.world_size
 
-                        for tensor in [val_loss, val_accuracy]:
+                        for tensor in [loss, accuracy]:
                             distributed.all_reduce(tensor)
 
-                        average_loss += val_loss
-                        average_accuracy += val_accuracy
+                        average_loss += loss
+                        average_accuracy += accuracy
 
                     average_loss /= (local_step + 1)
                     average_accuracy /= (local_step + 1)
@@ -287,22 +268,22 @@ def main(args):
             average_loss = 0
             average_accuracy = 0
 
-            for local_step, (val_images, val_labels) in enumerate(val_data_loader):
+            for local_step, (images, targets) in enumerate(val_data_loader):
 
-                val_images = val_images.cuda()
-                val_labels = val_labels.cuda()
+                images = images.cuda(non_blocking=True)
+                targets = targets.cuda(non_blocking=True)
 
-                val_logits = model(val_images)
-                val_loss = criterion(val_logits, val_labels) / config.world_size
+                logits = model(images)
+                loss = criterion(logits, targets) / config.world_size
 
-                val_predictions = val_logits.topk(1)[1].squeeze()
-                val_accuracy = torch.mean((val_predictions == val_labels).float()) / config.world_size
+                predictions = torch.argmax(logits, dim=1)
+                accuracy = torch.mean((predictions == targets).float()) / config.world_size
 
-                for tensor in [val_loss, val_accuracy]:
+                for tensor in [loss, accuracy]:
                     distributed.all_reduce(tensor)
 
-                average_loss += val_loss
-                average_accuracy += val_accuracy
+                average_loss += loss
+                average_accuracy += accuracy
 
             average_loss /= (local_step + 1)
             average_accuracy /= (local_step + 1)
@@ -319,6 +300,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Single-Path-NAS')
     parser.add_argument('--config', type=str, default='')
     parser.add_argument('--checkpoint', type=str, default='')
+    parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--training', action='store_true')
     parser.add_argument('--validation', action='store_true')
     args = parser.parse_args()
