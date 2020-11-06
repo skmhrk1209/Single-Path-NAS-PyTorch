@@ -1,29 +1,25 @@
-import torch
-from torch import nn
-from torch import distributed
-from torch import optim
-from torch import utils
-from torch import cuda
-from torch import backends
-from torch import autograd
-from torchvision import datasets
-from torchvision import transforms
-from torchvision import models
-from tensorboardX import SummaryWriter
-from models import *
-from ops import *
-from datasets import *
-from distributed import *
-from utils import *
-import numpy as np
-import skimage
-import functools
+import os
 import argparse
 import shutil
-import copy
 import json
 import time
-import os
+
+import torch
+import numpy as np
+
+from torch import optim
+from torch import cuda
+from torch import backends
+from torch import utils
+from torch import distributed as torch_distributed
+from torchvision import transforms
+from tensorboardX import SummaryWriter
+
+from models import SuperMobileNetV2
+from ops import CrossEntropyLoss
+from datasets import ImageNet
+from distributed import init_process_group
+from utils import Dict, apply_dict
 
 
 def main(args):
@@ -34,10 +30,10 @@ def main(args):
         config = apply_dict(Dict, json.load(file))
     config.update(vars(args))
     config.update(dict(
-        world_size=distributed.get_world_size(),
-        global_rank=distributed.get_rank(),
+        world_size=torch_distributed.get_world_size(),
+        global_rank=torch_distributed.get_rank(),
         device_count=cuda.device_count(),
-        local_rank=distributed.get_rank() % cuda.device_count()
+        local_rank=torch_distributed.get_rank() % cuda.device_count()
     ))
     print(f'config: {config}')
 
@@ -117,7 +113,7 @@ def main(args):
     ).cuda()
 
     for tensor in model.state_dict().values():
-        distributed.broadcast(tensor, 0)
+        torch_distributed.broadcast(tensor, 0)
 
     criterion = CrossEntropyLoss(config.label_smoothing)
 
@@ -181,7 +177,7 @@ def main(args):
                 loss.backward()
 
                 for parameter in model.parameters():
-                    distributed.all_reduce(parameter.grad)
+                    torch_distributed.all_reduce(parameter.grad)
 
                 optimizer.step()
 
@@ -189,7 +185,7 @@ def main(args):
                 accuracy = torch.mean((predictions == targets).float()) / config.world_size
 
                 for tensor in [loss, accuracy]:
-                    distributed.all_reduce(tensor)
+                    torch_distributed.all_reduce(tensor)
 
                 step_end = time.time()
 
@@ -238,7 +234,7 @@ def main(args):
                         accuracy = torch.mean((predictions == targets).float()) / config.world_size
 
                         for tensor in [loss, accuracy]:
-                            distributed.all_reduce(tensor)
+                            torch_distributed.all_reduce(tensor)
 
                         average_loss += loss
                         average_accuracy += accuracy
@@ -280,7 +276,7 @@ def main(args):
                 accuracy = torch.mean((predictions == targets).float()) / config.world_size
 
                 for tensor in [loss, accuracy]:
-                    distributed.all_reduce(tensor)
+                    torch_distributed.all_reduce(tensor)
 
                 average_loss += loss
                 average_accuracy += accuracy

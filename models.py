@@ -1,8 +1,9 @@
+import copy
+
 import torch
 from torch import nn
 from torch import distributed
-from ops import *
-import copy
+from ops import SuperConv2d
 
 
 class SuperMobileConvBlock(nn.Module):

@@ -1,4 +1,3 @@
-import torch
 from torch import distributed
 from mpi4py import MPI
 import socket
