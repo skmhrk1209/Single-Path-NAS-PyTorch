@@ -81,7 +81,7 @@ class SuperConv2d(nn.Module):
                 if prev_out_channels:
                     channel_norm = torch.norm(self.weight * channel_mask)
                     if channel_norm < channel_threshold:
-                        weight = weight[..., :prev_out_channels]
+                        weight = weight[:, :prev_out_channels, ...]
                         break
                 prev_out_channels = out_channels
         if self.kernel_masks is not None and self.kernel_thresholds is not None:
